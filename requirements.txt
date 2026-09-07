@@ -1,9 +1,6 @@
-gradio
+streamlit
 pandas
 numpy
 scikit-learn
 joblib
 rdkit
-xgboost
-matplotlib
-shap
