@@ -1,242 +1,182 @@
-import streamlit as st
 import os
-import gradio as gr
-import pandas as pd
-import numpy as np
-import joblib
-
-from rdkit import Chem
-from rdkit.Chem import Descriptors, Lipinski, Crippen, rdMolDescriptors
-
 from pathlib import Path
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-BASE = Path(__file__).resolve().parent
-
-MODEL_FILE = BASE / "models" / "random_forest_tuned.pkl"
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+from rdkit import Chem
+from rdkit.Chem import Descriptors
 
 
-# ============================================================
-# LOAD TRAINED MODEL
-# ============================================================
-
-model = joblib.load(MODEL_FILE)
-
-
-# ============================================================
-# SAME DESCRIPTORS USED DURING TRAINING
-# ============================================================
-
-descriptor_functions = {
-    "MolWt": Descriptors.MolWt,
-    "LogP": Crippen.MolLogP,
-    "TPSA": rdMolDescriptors.CalcTPSA,
-    "HBD": Lipinski.NumHDonors,
-    "HBA": Lipinski.NumHAcceptors,
-    "RotatableBonds": Lipinski.NumRotatableBonds,
-    "RingCount": Lipinski.RingCount,
-    "HeavyAtomCount": Lipinski.HeavyAtomCount,
-    "FractionCSP3": rdMolDescriptors.CalcFractionCSP3,
-    "NumAromaticRings": rdMolDescriptors.CalcNumAromaticRings,
-    "NumAliphaticRings": rdMolDescriptors.CalcNumAliphaticRings,
-    "NumHeteroatoms": Lipinski.NumHeteroatoms,
-    "NumSaturatedRings": rdMolDescriptors.CalcNumSaturatedRings,
-    "NumAromaticHeterocycles": rdMolDescriptors.CalcNumAromaticHeterocycles,
-    "NumAliphaticHeterocycles": rdMolDescriptors.CalcNumAliphaticHeterocycles,
-}
+st.set_page_config(
+    page_title="hERG Prediction Model",
+    page_icon="🧪",
+    layout="wide",
+)
 
 
-# ============================================================
-# DESCRIPTOR CALCULATION
-# ============================================================
+@st.cache_resource
+def load_model():
+    """Load the first available trained model."""
+    model_path = os.getenv("MODEL_PATH")
 
-def calculate_descriptors(smiles):
-
-    mol = Chem.MolFromSmiles(smiles)
-
-    if mol is None:
-        return None, None
-
-    values = {}
-
-    for name, function in descriptor_functions.items():
-
-        try:
-            values[name] = function(mol)
-
-        except Exception:
-            values[name] = np.nan
-
-    descriptors = pd.DataFrame([values])
-
-    return mol, descriptors
-
-
-# ============================================================
-# PREDICTION FUNCTION
-# ============================================================
-
-def predict_herg(smiles):
-
-    if smiles is None or not smiles.strip():
-
-        return (
-            "Please enter a SMILES string.",
-            "",
-            None,
-            ""
-        )
-
-    smiles = smiles.strip()
-
-    mol, X = calculate_descriptors(smiles)
-
-    if mol is None:
-
-        return (
-            "Invalid SMILES",
-            "",
-            None,
-            "RDKit could not parse the supplied SMILES string."
-        )
-
-    try:
-
-        prediction = int(model.predict(X)[0])
-
-        probability = float(
-            model.predict_proba(X)[0][1]
-        )
-
-    except Exception as e:
-
-        return (
-            "Prediction error",
-            "",
-            None,
-            str(e)
-        )
-
-    probability_percent = probability * 100
-
-    if prediction == 1:
-
-        label = "⚠️ hERG BLOCKER / HIGHER RISK"
-
-    else:
-
-        label = "✅ NON-BLOCKER / LOWER PREDICTED RISK"
-
-    descriptor_table = X.T.reset_index()
-
-    descriptor_table.columns = [
-        "Descriptor",
-        "Value"
+    candidates = [
+        model_path,
+        "model.pkl",
+        "model.joblib",
+        "hERG_model.pkl",
+        "hERG_model.joblib",
+        "models/model.pkl",
+        "models/model.joblib",
     ]
 
-    explanation = (
-        f"Predicted class: {prediction}\n"
-        f"hERG blocker probability: "
-        f"{probability_percent:.2f}%\n\n"
-        "This is an in-silico machine-learning prediction "
-        "and should not be interpreted as a clinical diagnosis "
-        "or experimental confirmation."
+    for path in candidates:
+        if path and Path(path).exists():
+            return joblib.load(path), path
+
+    return None, None
+
+
+def calculate_descriptors(smiles):
+    """Convert a SMILES string into RDKit molecular descriptors."""
+    molecule = Chem.MolFromSmiles(smiles)
+
+    if molecule is None:
+        raise ValueError("Invalid SMILES string.")
+
+    descriptor_values = []
+    descriptor_names = []
+
+    for name, function in Descriptors.descList:
+        try:
+            value = function(molecule)
+            descriptor_values.append(float(value))
+            descriptor_names.append(name)
+        except Exception:
+            descriptor_values.append(0.0)
+            descriptor_names.append(name)
+
+    values = np.nan_to_num(
+        np.asarray(descriptor_values, dtype=float),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
     )
 
-    return (
-        label,
-        f"{probability_percent:.2f}%",
-        descriptor_table,
-        explanation
+    return values, descriptor_names
+
+
+def prepare_features(model, smiles):
+    """Prepare descriptor features for the loaded model."""
+    descriptors, names = calculate_descriptors(smiles)
+
+    expected_features = getattr(model, "n_features_in_", None)
+
+    if expected_features is not None:
+        expected_features = int(expected_features)
+
+        if len(descriptors) < expected_features:
+            descriptors = np.pad(
+                descriptors,
+                (0, expected_features - len(descriptors)),
+                constant_values=0,
+            )
+        else:
+            descriptors = descriptors[:expected_features]
+
+    return pd.DataFrame([descriptors], columns=names[: len(descriptors)])
+
+
+def predict(model, smiles):
+    """Generate a prediction and optional probability."""
+    features = prepare_features(model, smiles)
+
+    try:
+        prediction = model.predict(features)[0]
+    except Exception:
+        # Supports models or pipelines that directly accept SMILES strings.
+        prediction = model.predict([smiles])[0]
+
+    probability = None
+
+    if hasattr(model, "predict_proba"):
+        try:
+            probabilities = model.predict_proba(features)[0]
+            probability = float(np.max(probabilities))
+        except Exception:
+            probability = None
+
+    return prediction, probability
+
+
+st.title("🧪 hERG Cardiotoxicity Prediction")
+st.write(
+    "Enter a molecule as a SMILES string to predict its hERG activity."
+)
+
+model, model_path = load_model()
+
+if model is None:
+    st.error(
+        "No trained model was found. Add a model file named "
+        "`model.pkl` or `model.joblib` to the repository."
+    )
+    st.stop()
+
+st.success(f"Loaded model: `{model_path}`")
+
+with st.sidebar:
+    st.header("Input")
+    smiles = st.text_input(
+        "SMILES string",
+        value="CCO",
+        help="Example: CCO represents ethanol.",
     )
 
-
-# ============================================================
-# GRADIO INTERFACE
-# ============================================================
-
-description = """
-## AI-Based hERG Effect Prediction
-
-Enter a molecular SMILES string to predict the probability
-of hERG-related cardiotoxicity using a trained machine-learning
-model.
-
-### Model
-Tuned Random Forest trained using RDKit molecular descriptors.
-
-### Output
-- Predicted hERG class
-- hERG blocker probability
-- Molecular descriptors
-
-**Important:** This tool is for research/educational purposes only.
-Predictions should be experimentally validated and must not be used
-as a clinical diagnosis.
-"""
-
-
-with gr.Blocks(title="AI-Based hERG Effect Prediction") as demo:
-
-    gr.Markdown(
-        "# 🧬 AI-Based hERG Effect Prediction"
+    predict_button = st.button(
+        "Predict",
+        type="primary",
+        use_container_width=True,
     )
 
-    gr.Markdown(description)
+if predict_button:
+    try:
+        prediction, probability = predict(model, smiles)
 
-    smiles_input = gr.Textbox(
-        label="SMILES",
-        placeholder="Example: CC(=O)OC1=CC=CC=C1C(=O)O",
-        lines=2
-    )
+        st.subheader("Prediction")
 
-    predict_button = gr.Button(
-        "Predict hERG Effect"
-    )
+        col1, col2 = st.columns(2)
 
-    prediction_output = gr.Textbox(
-        label="Prediction"
-    )
+        with col1:
+            st.metric("Predicted class", str(prediction))
 
-    probability_output = gr.Textbox(
-        label="hERG Blocker Probability"
-    )
+        with col2:
+            if probability is not None:
+                st.metric("Confidence", f"{probability:.2%}")
 
-    descriptors_output = gr.Dataframe(
-        label="Calculated Molecular Descriptors"
-    )
+        st.success("Prediction completed successfully.")
 
-    explanation_output = gr.Textbox(
-        label="Details",
-        lines=6
-    )
+        descriptor_values, descriptor_names = calculate_descriptors(smiles)
 
-    predict_button.click(
-        fn=predict_herg,
-        inputs=smiles_input,
-        outputs=[
-            prediction_output,
-            probability_output,
-            descriptors_output,
-            explanation_output
-        ]
-    )
+        with st.expander("Molecular descriptors"):
+            descriptor_table = pd.DataFrame(
+                {
+                    "Descriptor": descriptor_names,
+                    "Value": descriptor_values,
+                }
+            )
+            st.dataframe(
+                descriptor_table,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    gr.Examples(
-        examples=[
-            ["CC(=O)OC1=CC=CC=C1C(=O)O"],
-            ["CN1CCC[C@H]1c1cccnc1"],
-        ],
-        inputs=smiles_input
-    )
+    except Exception as error:
+        st.error(f"Prediction failed: {error}")
 
-if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
-        ssr_mode=False
-    )
+
+st.divider()
+st.caption(
+    "This application is intended for research and educational use only."
+)
